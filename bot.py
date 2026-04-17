@@ -21,9 +21,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ✅ DIRECT VALUES (No .env)
-TOKEN = "8356452802:AAFhxIqvFLGMieSDrlHFtnxMmDcgydrNcXs"
-OWNER_ID =8258235296
-ADMIN_ID =8258235296
+TOKEN = "8688370712:AAGzqgKs4_ncJI59OrPKRKmqas18nWYB34k"
+OWNER_ID =8461081198
+ADMIN_ID =8461081198
 YOUR_USERNAME = "@MANSURIxGOD"
 UPDATE_CHANNEL = "https://t.me/tech_zone_dev"
 
