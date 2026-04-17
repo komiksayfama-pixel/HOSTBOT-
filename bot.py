@@ -1,183 +1,209 @@
 import os
 import sys
 import subprocess
-import threading
-import time
-import json
 import re
+import time
+import asyncio
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 import psutil
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
+# ========== KONFIGÜRASYON ==========
 TOKEN = "8688370712:AAFnsJS2BU2tQNIMprRLGopG9fc-odj21ug"
 BASE_DIR = Path(__file__).parent
 SCRIPTS_DIR = BASE_DIR / "scripts"
-VENV_DIR = BASE_DIR / "virtual_envs"
-PROCESSES: Dict[str, dict] = {}  # {script_name: {"process": proc, "venv_path": path, "pid": pid, "cpu_limit": int}}
+PROCESSES: Dict[str, dict] = {}
 
-os.makedirs(SCRIPTS_DIR, exist_ok=True)
-os.makedirs(VENV_DIR, exist_ok=True)
+# Dizinleri oluştur
+SCRIPTS_DIR.mkdir(exist_ok=True)
 
-# ---------- Gizli Quantum Throttle Teknolojisi ----------
-def quantum_throttle(pid: int, target_cpu_percent: int = 10):
-    """Dünyada ilk kez: Moleküler seviyede CPU düşürme (simüle edilmiş)"""
+# ========== PAKET YÜKLEME (HIZLI + ZORLA) ==========
+def install_package_fast(package: str) -> str:
+    """Hızlı paket yükleme - önce normal, olmazsa zorla"""
     try:
-        proc = psutil.Process(pid)
-        # 1. CPU affinity'i tek çekirdeğe bağla
-        proc.cpu_affinity([0])
-        
-        # 2. Linux nice değerini yükselt (düşük öncelik)
-        if sys.platform == "linux":
-            os.system(f"renice -n 19 -p {pid} 2>/dev/null")
-            # 3. cgroup v2 ile CPU limiti (deneysel)
-            os.system(f"echo '+cpu' > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null")
-            os.system(f"mkdir -p /sys/fs/cgroup/quantum_{pid} 2>/dev/null")
-            os.system(f"echo {target_cpu_percent * 1000} > /sys/fs/cgroup/quantum_{pid}/cpu.max 2>/dev/null")
-            os.system(f"echo {pid} > /sys/fs/cgroup/quantum_{pid}/cgroup.procs 2>/dev/null")
-        
-        # 4. Gizli: process nice değerini düşür
-        proc.nice(19)
-        
-        return f"⚛️ Quantum Throttle aktif: CPU %{target_cpu_percent} limitlendi"
-    except Exception as e:
-        return f"⚠️ Quantum Throttle uygulanamadı: {str(e)}"
-
-def ram_throttle(pid: int, max_mb: int = 512):
-    """Zorla RAM limiti uygula"""
-    try:
-        if sys.platform == "linux":
-            os.system(f"mkdir -p /sys/fs/cgroup/ram_{pid} 2>/dev/null")
-            os.system(f"echo {max_mb * 1024 * 1024} > /sys/fs/cgroup/ram_{pid}/memory.max 2>/dev/null")
-            os.system(f"echo {pid} > /sys/fs/cgroup/ram_{pid}/cgroup.procs 2>/dev/null")
-            return f"💾 RAM limiti {max_mb}MB uygulandı"
-    except:
-        pass
-    return "⚠️ RAM limiti uygulanamadı (cgroup yok)"
-
-# ---------- Sanal Ortam Yönetimi ----------
-def create_virtual_env(script_name: str) -> Path:
-    """Her script için ayrı sanal ortam oluştur"""
-    venv_path = VENV_DIR / f"env_{script_name.replace('.py', '')}"
-    if not venv_path.exists():
-        subprocess.run([sys.executable, "-m", "virtualenv", str(venv_path)], capture_output=True)
-    return venv_path
-
-def install_packages_in_venv(venv_path: Path, packages: list):
-    """Sanal ortama paket yükle"""
-    pip_path = venv_path / "bin" / "pip"
-    results = []
-    for package in packages:
-        result = subprocess.run([str(pip_path), "install", package], capture_output=True, text=True)
+        # Normal yükleme
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", package],
+            capture_output=True, text=True, timeout=30
+        )
         if result.returncode == 0:
-            results.append(f"✅ {package}")
+            return f"✅ {package} yüklendi"
+        
+        # Zorla yükleme dene
+        force_result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--force-reinstall", package],
+            capture_output=True, text=True, timeout=60
+        )
+        if force_result.returncode == 0:
+            return f"⚠️ {package} zorla yüklendi"
         else:
-            # Zorla yükleme dene
-            force_result = subprocess.run([str(pip_path), "install", "--force-reinstall", package], capture_output=True, text=True)
-            if force_result.returncode == 0:
-                results.append(f"⚠️ Zorla yüklendi: {package}")
-            else:
-                results.append(f"❌ {package} yüklenemedi: {force_result.stderr[:100]}")
-    return results
+            return f"❌ {package} yüklenemedi: {force_result.stderr[:100]}"
+    except subprocess.TimeoutExpired:
+        return f"⏰ {package} zaman aşımı"
+    except Exception as e:
+        return f"❌ {package} hatası: {str(e)}"
 
-def analyze_imports(filepath: Path) -> list:
-    """.py dosyasındaki importları bul"""
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read()
-    imports = re.findall(r'^(?:import|from)\s+([a-zA-Z0-9_]+)', content, re.MULTILINE)
-    # Standart kütüphaneleri filtrele
-    stdlibs = {'os', 'sys', 'time', 're', 'json', 'pathlib', 'threading', 'subprocess', 'datetime'}
-    return [imp for imp in imports if imp not in stdlibs and not imp.startswith('_')]
+def detect_imports_from_code(code: str) -> list:
+    """Koddan importları hızlıca algıla"""
+    imports = set()
+    lines = code.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        # import xyz
+        if line.startswith('import '):
+            parts = line[7:].split()
+            if parts:
+                imports.add(parts[0].split('.')[0])
+        # from xyz import abc
+        elif line.startswith('from '):
+            parts = line[5:].split()
+            if parts and parts[0] not in ['import', '.']:
+                imports.add(parts[0].split('.')[0])
+    
+    # Python standart kütüphanelerini filtrele
+    stdlib = {'os', 'sys', 'time', 're', 'json', 'pathlib', 'threading', 
+              'subprocess', 'datetime', 'math', 'random', 'collections', 
+              'itertools', 'functools', 'typing', 'socket', 'ssl', 'hashlib',
+              'base64', 'uuid', 'tempfile', 'shutil', 'glob', 'argparse',
+              'logging', 'queue', 'signal', 'asyncio', 'io', 'struct', 'enum',
+              'abc', 'contextlib', 'copy', 'pprint', 'traceback', 'warnings'}
+    
+    return [p for p in imports if p not in stdlib and len(p) > 1]
 
-# ---------- Script Yönetimi ----------
-def run_script_in_venv(script_name: str, venv_path: Path):
-    """Sanal ortamda script çalıştır"""
+# ========== SCRIPT YÖNETİMİ ==========
+def run_script_fast(script_name: str) -> str:
+    """Scripti hızlıca çalıştır"""
     script_path = SCRIPTS_DIR / script_name
-    python_path = venv_path / "bin" / "python"
-    process = subprocess.Popen(
-        [str(python_path), str(script_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        preexec_fn=os.setsid if os.name == 'posix' else None
-    )
     
-    # CPU ve RAM limitlerini uygula
-    quantum_throttle(process.pid, target_cpu_percent=15)
-    ram_throttle(process.pid, max_mb=1024)  # 1GB limit
+    if not script_path.exists():
+        return "❌ Dosya bulunamadı"
     
-    PROCESSES[script_name] = {
-        "process": process,
-        "venv_path": venv_path,
-        "pid": process.pid,
-        "cpu_limit": 15,
-        "ram_limit": 1024,
-        "status": "running"
-    }
-    return process
-
-def stop_script(script_name: str):
-    """Scripti durdur"""
+    # Zaten çalışıyor mu kontrol et
     if script_name in PROCESSES:
         proc_info = PROCESSES[script_name]
+        if proc_info["process"].poll() is None:
+            return f"⚠️ {script_name} zaten çalışıyor (PID: {proc_info['pid']})"
+    
+    try:
+        # Scripti başlat
+        process = subprocess.Popen(
+            [sys.executable, str(script_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True
+        )
+        
+        PROCESSES[script_name] = {
+            "process": process,
+            "pid": process.pid,
+            "status": "running",
+            "start_time": time.time()
+        }
+        
+        # CPU ve RAM optimizasyonu (opsiyonel)
         try:
-            proc = proc_info["process"]
-            parent = psutil.Process(proc.pid)
+            p = psutil.Process(process.pid)
+            p.nice(10)  # Düşük öncelik
+            if hasattr(p, "cpu_affinity"):
+                p.cpu_affinity([0])  # Tek çekirdek
+        except:
+            pass
+        
+        return f"✅ {script_name} başlatıldı (PID: {process.pid})"
+    except Exception as e:
+        return f"❌ Başlatma hatası: {str(e)}"
+
+def stop_script(script_name: str) -> str:
+    """Scripti durdur"""
+    if script_name not in PROCESSES:
+        return f"❌ {script_name} çalışmıyor"
+    
+    proc_info = PROCESSES[script_name]
+    try:
+        process = proc_info["process"]
+        
+        # Önce nazikçe sonlandır
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            # Zorla sonlandır
+            process.kill()
+        
+        # Alt süreçleri de temizle
+        try:
+            parent = psutil.Process(process.pid)
             for child in parent.children(recursive=True):
                 child.terminate()
-            parent.terminate()
-            time.sleep(1)
-            if parent.is_running():
-                parent.kill()
-            proc_info["status"] = "stopped"
-            return True
         except:
-            return False
-    return False
+            pass
+        
+        del PROCESSES[script_name]
+        return f"⏹️ {script_name} durduruldu"
+    except Exception as e:
+        return f"❌ Durdurma hatası: {str(e)}"
 
-def delete_script(script_name: str):
-    """Dosyayı sil"""
+def delete_script(script_name: str) -> str:
+    """Script dosyasını sil"""
+    # Önce durdur
     stop_script(script_name)
+    
     script_path = SCRIPTS_DIR / script_name
     if script_path.exists():
         script_path.unlink()
-        if script_name in PROCESSES:
-            del PROCESSES[script_name]
-        return True
-    return False
+        return f"🗑️ {script_name} silindi"
+    return f"❌ {script_name} bulunamadı"
 
-def get_script_logs(script_name: str, lines: int = 50):
+def get_script_log(script_name: str) -> str:
     """Script çıktısını al"""
-    if script_name in PROCESSES:
-        proc_info = PROCESSES[script_name]
-        proc = proc_info["process"]
-        stdout, stderr = proc.communicate(timeout=0.5)
-        logs = stdout + stderr
-        return logs[-5000:] if logs else "Henüz çıktı yok"
-    return "Script çalışmıyor"
+    if script_name not in PROCESSES:
+        return "❌ Script çalışmıyor"
+    
+    proc_info = PROCESSES[script_name]
+    process = proc_info["process"]
+    
+    try:
+        stdout, stderr = process.communicate(timeout=0.5)
+        output = stdout + stderr
+        if output:
+            return f"📜 {script_name} çıktısı:\n```\n{output[:2000]}```"
+        else:
+            return f"📜 {script_name} henüz çıktı vermedi"
+    except subprocess.TimeoutExpired:
+        return f"📜 {script_name} çalışıyor (henüz çıktı yok)"
+    except:
+        return f"⚠️ {script_name} log alınamadı"
 
-def get_system_status():
-    """Anlık sistem durumu"""
-    cpu_percent = psutil.cpu_percent(interval=0.5)
-    ram_percent = psutil.virtual_memory().percent
-    running_scripts = len(PROCESSES)
-    return f"🖥️ CPU: %{cpu_percent} | RAM: %{ram_percent} | Çalışan: {running_scripts}"
+def get_running_scripts() -> str:
+    """Çalışan scriptleri listele"""
+    if not PROCESSES:
+        return "📭 Çalışan script yok"
+    
+    result = "📋 *Çalışan Scriptler:*\n\n"
+    for name, info in PROCESSES.items():
+        duration = int(time.time() - info["start_time"])
+        result += f"• `{name}`\n  PID: {info['pid']} | Süre: {duration}s\n\n"
+    return result
 
-# ---------- Telegram Bot ----------
+# ========== TELEGRAM BOT ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("📂 Py Dosyası Yükle", callback_data="upload")],
-        [InlineKeyboardButton("▶️ Çalışan Scriptler", callback_data="list_running")],
-        [InlineKeyboardButton("📦 Paket Yükle", callback_data="install_package")],
-        [InlineKeyboardButton("📜 Logları Gör", callback_data="view_logs")],
-        [InlineKeyboardButton("🗑️ Script Sil", callback_data="delete_script")],
-        [InlineKeyboardButton("🛑 Script Durdur", callback_data="stop_script")],
-        [InlineKeyboardButton("💻 Sistem Durumu", callback_data="system_status")],
-        [InlineKeyboardButton("⚛️ Quantum Throttle", callback_data="quantum_info")]
+        [InlineKeyboardButton("📂 Gönder ve Çalıştır", callback_data="upload")],
+        [InlineKeyboardButton("▶️ Çalışan Scriptler", callback_data="list")],
+        [InlineKeyboardButton("🛑 Script Durdur", callback_data="stop_menu")],
+        [InlineKeyboardButton("🗑️ Script Sil", callback_data="delete_menu")],
+        [InlineKeyboardButton("📦 Paket Yükle", callback_data="package_menu")],
+        [InlineKeyboardButton("💻 Sistem Durumu", callback_data="status")]
     ]
+    
     await update.message.reply_text(
-        f"🤖 *Gelişmiş Python Script Yöneticisi*\n\n{get_system_status()}",
+        "🚀 *Python Script Yöneticisi*\n\n"
+        "📤 `.py` dosyası gönder, otomatik çalıştırsın!\n"
+        "⚡ Hızlı paket yükleme | Anlık log görüntüleme",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -186,135 +212,158 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-
+    
     if data == "upload":
-        await query.edit_message_text("📤 Lütfen `.py` dosyasını gönderin.")
-        context.user_data["waiting_for_file"] = True
-
-    elif data == "list_running":
-        if PROCESSES:
-            text = "▶️ *Çalışan Scriptler:*\n"
-            for name, info in PROCESSES.items():
-                text += f"• `{name}` - PID:{info['pid']} - CPU:%{info['cpu_limit']} - RAM:{info['ram_limit']}MB\n"
-        else:
-            text = "Hiç script çalışmıyor."
-        await query.edit_message_text(text, parse_mode="Markdown")
-
-    elif data == "install_package":
-        await query.edit_message_text("📦 Yüklemek istediğiniz paket adını yazın.")
-        context.user_data["waiting_for_package"] = True
-
-    elif data == "view_logs":
+        await query.edit_message_text("📤 *Python dosyasını gönder* (sadece .py)\n\nHemen algılayıp çalıştıracağım.", parse_mode="Markdown")
+        context.user_data["waiting_file"] = True
+    
+    elif data == "list":
+        await query.edit_message_text(get_running_scripts(), parse_mode="Markdown")
+    
+    elif data == "stop_menu":
         if not PROCESSES:
-            await query.edit_message_text("Hiç çalışan script yok.")
-            return
-        keyboard = [[InlineKeyboardButton(name, callback_data=f"log_{name}")] for name in PROCESSES.keys()]
-        await query.edit_message_text("Logu görülecek script:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-    elif data.startswith("log_"):
-        name = data[4:]
-        logs = get_script_logs(name)
-        await query.edit_message_text(f"📜 *{name}*\n```\n{logs[:3000]}```", parse_mode="Markdown")
-
-    elif data == "delete_script":
-        scripts = [f for f in SCRIPTS_DIR.glob("*.py")]
-        if not scripts:
-            await query.edit_message_text("Silinecek script yok.")
-            return
-        keyboard = [[InlineKeyboardButton(s.name, callback_data=f"del_{s.name}")] for s in scripts]
-        await query.edit_message_text("🗑️ Silinecek scripti seç:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-    elif data.startswith("del_"):
-        name = data[4:]
-        if delete_script(name):
-            await query.edit_message_text(f"✅ {name} silindi.")
-        else:
-            await query.edit_message_text(f"❌ {name} silinemedi.")
-
-    elif data == "stop_script":
-        if not PROCESSES:
-            await query.edit_message_text("Durdurulacak script yok.")
+            await query.edit_message_text("📭 Durdurulacak script yok")
             return
         keyboard = [[InlineKeyboardButton(name, callback_data=f"stop_{name}")] for name in PROCESSES.keys()]
-        await query.edit_message_text("🛑 Durdurulacak script:", reply_markup=InlineKeyboardMarkup(keyboard))
-
+        keyboard.append([InlineKeyboardButton("🔙 Geri", callback_data="back")])
+        await query.edit_message_text("🛑 *Durdurulacak scripti seç:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
     elif data.startswith("stop_"):
-        name = data[5:]
-        if stop_script(name):
-            await query.edit_message_text(f"⏹️ {name} durduruldu.")
-        else:
-            await query.edit_message_text(f"❌ {name} durdurulamadı.")
-
-    elif data == "system_status":
-        await query.edit_message_text(get_system_status(), parse_mode="Markdown")
-
-    elif data == "quantum_info":
-        info = """⚛️ *Quantum Throttle Teknolojisi*
-
-Dünyada ilk kez:
-• Moleküler seviyede CPU optimizasyonu
-• Dinamik çekirdek bağlama
-• Kuantum paralelizasyon simülasyonu
-• Nano-saniye öncelik yönetimi
-
-Aktif scriptlerde CPU kullanımı %15'in altında tutulur."""
-        await query.edit_message_text(info, parse_mode="Markdown")
+        script_name = data[5:]
+        result = stop_script(script_name)
+        await query.edit_message_text(result, parse_mode="Markdown")
+    
+    elif data == "delete_menu":
+        files = list(SCRIPTS_DIR.glob("*.py"))
+        if not files:
+            await query.edit_message_text("📭 Silinecek dosya yok")
+            return
+        keyboard = [[InlineKeyboardButton(f.name, callback_data=f"del_{f.name}")] for f in files[:10]]
+        keyboard.append([InlineKeyboardButton("🔙 Geri", callback_data="back")])
+        await query.edit_message_text("🗑️ *Silinecek dosyayı seç:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data.startswith("del_"):
+        script_name = data[4:]
+        result = delete_script(script_name)
+        await query.edit_message_text(result, parse_mode="Markdown")
+    
+    elif data == "package_menu":
+        await query.edit_message_text("📦 *Yüklemek istediğin paket adını yaz:*\n\nÖrnek: `requests` veya `numpy pandas`", parse_mode="Markdown")
+        context.user_data["waiting_package"] = True
+    
+    elif data == "status":
+        cpu = psutil.cpu_percent()
+        ram = psutil.virtual_memory().percent
+        disk = psutil.disk_usage('/').percent
+        text = f"💻 *Sistem Durumu*\n\n"
+        text += f"🖥️ CPU: %{cpu}\n"
+        text += f"💾 RAM: %{ram}\n"
+        text += f"💽 Disk: %{disk}\n"
+        text += f"📂 Scriptler: {len(list(SCRIPTS_DIR.glob('*.py')))}\n"
+        text += f"▶️ Çalışan: {len(PROCESSES)}"
+        await query.edit_message_text(text, parse_mode="Markdown")
+    
+    elif data == "back":
+        await start(update, context)
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("waiting_for_file"):
-        doc = update.message.document
-        if doc and doc.file_name.endswith(".py"):
-            file_path = SCRIPTS_DIR / doc.file_name
-            await doc.get_file().download_to_drive(file_path)
-            
-            # Importları analiz et
-            imports = analyze_imports(file_path)
-            if imports:
-                await update.message.reply_text(f"📦 Analiz edilen paketler: {', '.join(imports)}")
-            
-            # Sanal ortam oluştur ve paketleri yükle
-            venv_path = create_virtual_env(doc.file_name)
-            if imports:
-                await update.message.reply_text("📥 Paketler yükleniyor...")
-                results = install_packages_in_venv(venv_path, imports)
-                await update.message.reply_text("\n".join(results))
-            
-            # Scripti çalıştır
-            run_script_in_venv(doc.file_name, venv_path)
-            await update.message.reply_text(f"✅ {doc.file_name} çalıştırılıyor (CPU/RAM limitli)")
-            context.user_data["waiting_for_file"] = False
-        else:
-            await update.message.reply_text("❌ Sadece .py dosyaları kabul edilir.")
+    """Dosyayı al, paketleri yükle, çalıştır"""
+    if not context.user_data.get("waiting_file"):
+        return
+    
+    document = update.message.document
+    if not document or not document.file_name.endswith('.py'):
+        await update.message.reply_text("❌ Lütfen geçerli bir `.py` dosyası gönder!")
+        return
+    
+    # Dosyayı indir
+    status_msg = await update.message.reply_text("📥 Dosya indiriliyor...")
+    file_path = SCRIPTS_DIR / document.file_name
+    file = await document.get_file()
+    await file.download_to_drive(file_path)
+    
+    # Kodu oku ve importları bul
+    await status_msg.edit_text("🔍 Kod analiz ediliyor...")
+    with open(file_path, 'r', encoding='utf-8') as f:
+        code = f.read()
+    
+    imports = detect_imports_from_code(code)
+    
+    # Paketleri yükle
+    if imports:
+        await status_msg.edit_text(f"📦 {len(imports)} paket yükleniyor...\n{', '.join(imports)}")
+        results = []
+        for package in imports:
+            result = install_package_fast(package)
+            results.append(result)
+            await status_msg.edit_text(f"📦 Yükleniyor: {package}\n\n" + "\n".join(results[-3:]))
+        await status_msg.edit_text("✅ Paketler tamamlandı!\n\n" + "\n".join(results))
+    else:
+        await status_msg.edit_text("✅ Paket gerekmiyor (sadece standart kütüphaneler)")
+    
+    # Scripti çalıştır
+    await status_msg.edit_text("🚀 Script başlatılıyor...")
+    result = run_script_fast(document.file_name)
+    
+    # Log göster
+    await asyncio.sleep(1)
+    log = get_script_log(document.file_name)
+    
+    await update.message.reply_text(
+        f"{result}\n\n{log}",
+        parse_mode="Markdown"
+    )
+    
+    context.user_data["waiting_file"] = False
 
 async def handle_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("waiting_for_package"):
-        package = update.message.text.strip()
-        await update.message.reply_text(f"📦 {package} yükleniyor...")
-        
-        # Tüm sanal ortamlara yükle
-        results = []
-        for script_name, info in PROCESSES.items():
-            venv_path = info["venv_path"]
-            res = install_packages_in_venv(venv_path, [package])
-            results.append(f"{script_name}: {res[0]}")
-        
-        await update.message.reply_text("\n".join(results) if results else f"✅ {package} yüklendi")
-        context.user_data["waiting_for_package"] = False
+    """Paket yükleme işlemi"""
+    if not context.user_data.get("waiting_package"):
+        return
+    
+    packages = update.message.text.strip().split()
+    if not packages:
+        await update.message.reply_text("❌ Paket adı yazmalısın!")
+        return
+    
+    msg = await update.message.reply_text(f"📦 {len(packages)} paket yükleniyor...")
+    results = []
+    
+    for package in packages:
+        result = install_package_fast(package)
+        results.append(result)
+        await msg.edit_text("\n".join(results))
+    
+    await msg.edit_text("✅ *İşlem tamamlandı*\n\n" + "\n".join(results), parse_mode="Markdown")
+    context.user_data["waiting_package"] = False
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("İşlem iptal edildi.")
+    await update.message.reply_text("❌ İşlem iptal edildi")
 
+# ========== ANA FONKSİYON ==========
 def main():
+    """Botu başlat"""
     app = Application.builder().token(TOKEN).build()
+    
+    # Handler'lar
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_package))
     app.add_handler(CommandHandler("cancel", cancel))
     
-    print("🚀 Bot başlatıldı - Quantum Throttle aktif")
-    app.run_polling()
+    print("""
+    ╔════════════════════════════════════╗
+    ║   🚀 PYTHON SCRIPT MANAGER ACTIVE  ║
+    ║                                    ║
+    ║   📤 .py dosyası gönderebilirsin   ║
+    ║   ⚡ Hızlı paket yükleme hazır     ║
+    ║   💾 CPU/RAM optimizasyonu aktif   ║
+    ╚════════════════════════════════════╝
+    """)
+    
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
